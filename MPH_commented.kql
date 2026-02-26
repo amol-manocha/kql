@@ -1,0 +1,742 @@
+// =============================================================================
+// GPS Speed (MPH) Pipeline — Eventhouse (KQL)
+// =============================================================================
+// Eventhouse : jsonload
+// Workspace  : telematics json
+// Source table: GPS (already populated via ExtractGPS update policy)
+//
+// =============================================================================
+// OVERVIEW
+// =============================================================================
+// This script builds an end-to-end pipeline that computes vehicle speed in
+// miles per hour (MPH) from raw GPS coordinate data collected by a smartphone
+// mounted in a moving vehicle.
+//
+// The smartphone continuously logs its GPS position (latitude, longitude,
+// altitude, heading, accuracy) at roughly 1 Hz.  By comparing consecutive
+// GPS fixes within the same trip, we can compute:
+//
+//   1. The geodesic distance (in meters) between successive positions.
+//   2. The elapsed time (in seconds) between successive timestamps.
+//   3. The instantaneous speed = distance / time, converted to MPH.
+//
+// =============================================================================
+// DATA FLOW
+// =============================================================================
+//
+//   RawTelematicsData  →  GPS  →  MPH_detail  (row-level speed)
+//                                  └→  MPH_summary  (materialized view, per-trip aggregates)
+//
+//   • RawTelematicsData : Raw JSON ingested from the phone sensors.
+//   • GPS               : Cleaned table with (tripId, timestamp, lat, lon, alt, heading, accuracy).
+//                          Populated by a separate ExtractGPS update policy (not in this script).
+//   • MPH_detail        : One row per GPS fix per trip, enriched with delta_seconds,
+//                          delta_meters, and mph.  Populated automatically by update policy.
+//   • MPH_summary       : Materialized view with one row per tripId containing
+//                          min/avg/max speed, total distance, and row counts.
+//                          Auto-maintained by the Eventhouse engine.
+//
+// =============================================================================
+// SPEED CALCULATION METHOD
+// =============================================================================
+//
+// For each consecutive pair of GPS fixes within the same trip:
+//
+//   distance_meters = geo_distance_2points(lon1, lat1, lon2, lat2)
+//
+//   This is a GEODESIC distance calculation (accounts for the curvature of
+//   the Earth) rather than a simple Euclidean/flat-earth approximation.
+//   It uses the WGS-84 ellipsoid model, which is the same reference system
+//   used by GPS satellites.
+//
+//   elapsed_seconds = (timestamp_current − timestamp_previous) in seconds
+//
+//   speed_m_per_s = distance_meters / elapsed_seconds
+//
+//   speed_mph = speed_m_per_s × 2.2369362920544
+//
+//   The constant 2.2369362920544 is the exact conversion factor from
+//   meters-per-second to miles-per-hour:
+//       1 m/s = 3600 s/hr ÷ 1609.344 m/mile = 2.2369362920544 mph
+//
+// =============================================================================
+// NOISE HANDLING
+// =============================================================================
+//
+// GPS data is inherently noisy.  Common issues include:
+//   • Position jumps when GPS signal is briefly lost (tunnels, urban canyons).
+//   • Multipath errors causing apparent teleportation between fixes.
+//   • Clock glitches causing zero or negative delta_seconds.
+//
+// This pipeline applies the following safeguards:
+//   • mph is set to NULL for the first row of each trip (no previous fix).
+//   • mph is set to NULL when delta_seconds ≤ 0 (clock issue).
+//   • mph is set to NULL when coordinates are missing.
+//   • mph is set to NULL when the computed speed exceeds 120 MPH
+//     (GPS noise guardrail — most consumer vehicles cannot sustain
+//      speeds above this, so values above it are almost certainly
+//      caused by GPS position jumps).
+//
+// =============================================================================
+// HOW TO RUN
+// =============================================================================
+// Run each numbered section (STEP 1 through STEP 5) one at a time, in order,
+// in the jsonload Eventhouse query editor.  Then run the VALIDATION queries
+// individually to verify correctness.
+// =============================================================================
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  STEP 1 — Create the MPH_detail table                                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// This table stores ONE ROW per GPS fix per trip, enriched with speed data.
+//
+// COLUMN DESCRIPTIONS:
+// ─────────────────────────────────────────────────────────────────────────────
+//   tripId             — Unique identifier for a driving trip/session.
+//                        All GPS fixes within the same drive share a tripId.
+//
+//   timestamp          — The time of the GPS fix as a KQL datetime.
+//                        (Originally stored as epoch seconds in the raw data;
+//                         converted to datetime during ingestion into GPS table.)
+//
+//   latitude           — GPS latitude in decimal degrees (WGS-84).
+//                        Range: −90.0 (south pole) to +90.0 (north pole).
+//
+//   longitude          — GPS longitude in decimal degrees (WGS-84).
+//                        Range: −180.0 (west) to +180.0 (east).
+//
+//   altitude           — GPS altitude in meters above the WGS-84 ellipsoid.
+//                        Note: this is NOT altitude above mean sea level;
+//                        the difference (geoid undulation) varies by location.
+//
+//   heading            — Compass heading / bearing in degrees (0–360).
+//                        0 = North, 90 = East, 180 = South, 270 = West.
+//                        Reported by the phone's GPS chipset.
+//
+//   verticalAccuracy   — Estimated vertical (altitude) accuracy in meters.
+//                        Smaller values = more accurate altitude reading.
+//
+//   horizontalAccuracy — Estimated horizontal (lat/lon) accuracy in meters.
+//                        Represents a circle of uncertainty around the reported
+//                        position.  Typical values: 3–10 m outdoors, 20–100 m
+//                        indoors or in urban canyons.
+//
+//   delta_seconds      — Elapsed time in seconds between this GPS fix and the
+//                        immediately preceding fix within the same trip.
+//                        NULL for the first fix of each trip.
+//                        Should typically be ~1.0 for 1 Hz GPS.
+//
+//   delta_meters       — Geodesic distance in meters between this fix and the
+//                        preceding fix within the same trip, computed using
+//                        geo_distance_2points() (WGS-84 ellipsoid model).
+//                        NULL for the first fix of each trip.
+//
+//   mph                — Instantaneous speed in miles per hour, computed as:
+//                            (delta_meters / delta_seconds) * 2.2369362920544
+//                        NULL when:
+//                          • First row of the trip (no previous fix).
+//                          • delta_seconds ≤ 0 (clock glitch).
+//                          • Missing coordinates.
+//                          • Computed speed > 120 MPH (GPS noise guardrail).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Run this command alone.
+
+.create table MPH_detail (
+    tripId: string,
+    timestamp: datetime,            // was long — epoch seconds → datetime
+    latitude: real,
+    longitude: real,
+    altitude: real,
+    heading: real,
+    verticalAccuracy: real,
+    horizontalAccuracy: real,
+    delta_seconds: real,
+    delta_meters: real,
+    mph: real
+)
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  STEP 2 — Create the ComputeMPHDetail function                          ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// This function reads from the "GPS" source table and computes speed (MPH)
+// for every consecutive pair of GPS fixes within the same trip.
+//
+// HIGH-LEVEL ALGORITHM:
+// ─────────────────────────────────────────────────────────────────────────────
+//   1. SORT:  Order all GPS rows by (tripId, timestamp) so that consecutive
+//             fixes within a trip are adjacent.
+//
+//   2. SERIALIZE:  Required by KQL for the prev() window function to work.
+//             The serialize operator guarantees deterministic row ordering
+//             so that prev() returns the physically preceding row.
+//
+//   3. PREV() LOOKBACK:  For each row, retrieve the tripId, timestamp,
+//             latitude, and longitude of the immediately preceding row.
+//             This gives us two consecutive GPS positions to compare.
+//
+//   4. DELTA SECONDS:  Compute elapsed time between consecutive fixes.
+//             KQL datetime subtraction yields a timespan; dividing by "1s"
+//             converts to a real number of seconds.
+//             Only computed when both rows belong to the same trip.
+//
+//   5. DELTA METERS:  Compute geodesic distance using the built-in KQL
+//             function geo_distance_2points(lon1, lat1, lon2, lat2).
+//             This function returns the shortest distance (in meters) on
+//             the WGS-84 ellipsoid between two geographic coordinates.
+//             Only computed when both rows belong to the same trip and
+//             both have non-null coordinates.
+//
+//   6. RAW MPH:  speed = (distance / time) × conversion_factor
+//             The conversion factor 2.2369362920544 converts m/s → mph.
+//             Only computed when delta_seconds > 0 and delta_meters is valid.
+//
+//   7. NOISE GUARDRAIL:  Any mph value exceeding 120.0 is set to NULL.
+//             GPS position jumps (e.g., tunnel exit, signal re-acquisition)
+//             can produce apparent distances of hundreds of meters in a
+//             single second, yielding unrealistic speeds.  120 MPH is a
+//             conservative ceiling for normal consumer driving.
+//
+//   8. PROJECT:  Select the final columns for the output table.
+//
+// IMPORTANT NOTE ON UPDATE POLICY USAGE:
+// ─────────────────────────────────────────────────────────────────────────────
+//   When this function is called by the update policy (Step 3), it receives
+//   only the NEWLY ingested micro-batch of GPS rows — not the entire table.
+//   The prev() function operates within this micro-batch, so the very first
+//   row of each batch will not have a previous reading and will get NULL
+//   for delta_seconds, delta_meters, and mph.  This means at most one row
+//   per ingestion batch per trip is lost, which is acceptable.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Run this command alone.
+
+.create-or-alter function ComputeMPHDetail() {
+    GPS
+    // ─── Step 1: Sort by trip and time so consecutive GPS fixes are adjacent ───
+    | order by tripId asc, timestamp asc
+    // ─── Step 2: Serialize is required for prev() window function ───
+    // Without serialize, KQL does not guarantee row order and prev() may
+    // return unexpected results.
+    | serialize
+    // ─── Step 3: Retrieve the previous row's values via prev() ───
+    // prev() returns the value from the immediately preceding row in the
+    // serialized order.  If this is the first row overall, prev() returns NULL.
+    | extend
+        prev_tripId = prev(tripId),       // tripId of the prior GPS fix
+        prev_ts     = prev(timestamp),    // timestamp of the prior GPS fix
+        prev_lat    = prev(latitude),     // latitude of the prior GPS fix
+        prev_lon    = prev(longitude)     // longitude of the prior GPS fix
+    | extend
+        // ─── Step 4: Compute elapsed time (seconds) between consecutive fixes ───
+        // (datetime − datetime) produces a KQL timespan value.
+        // Dividing by "1s" (one second) converts the timespan to a real number.
+        // Example: if timestamps are 1 second apart, result = 1.0
+        //
+        // We only compute this when both rows belong to the SAME trip
+        // (tripId == prev_tripId) to avoid computing delta across trip boundaries.
+        // The first row of each trip gets NULL because prev_ts is either NULL
+        // or belongs to a different trip.
+        delta_seconds = iff(tripId == prev_tripId and isnotnull(prev_ts),
+                            toreal((timestamp - prev_ts) / 1s),
+                            real(null)),
+
+        // ─── Step 5: Compute geodesic distance (meters) between consecutive fixes ───
+        // geo_distance_2points(lon1, lat1, lon2, lat2) computes the shortest
+        // distance on the WGS-84 ellipsoid between two geographic points.
+        //
+        // Parameter order is (longitude, latitude) — NOT (latitude, longitude).
+        // This is a common source of bugs; KQL follows the (x, y) convention
+        // where longitude is the x-axis and latitude is the y-axis.
+        //
+        // The function handles the curvature of the Earth correctly, unlike
+        // Euclidean distance formulas which become increasingly inaccurate
+        // at larger distances or higher latitudes.
+        //
+        // We only compute this when:
+        //   • Both rows belong to the same trip.
+        //   • All four coordinates (prev_lat, prev_lon, lat, lon) are non-null.
+        delta_meters  = iff(tripId == prev_tripId
+                            and isnotnull(prev_lat) and isnotnull(prev_lon)
+                            and isnotnull(latitude)  and isnotnull(longitude),
+                            geo_distance_2points(prev_lon, prev_lat, longitude, latitude),
+                            real(null))
+    | extend
+        // ─── Step 6: Compute raw speed in miles per hour ───
+        // Formula:  speed = distance / time × conversion_factor
+        //
+        //   delta_meters / delta_seconds  =  speed in meters per second (m/s)
+        //   × 2.2369362920544             =  speed in miles per hour (mph)
+        //
+        // Conversion derivation:
+        //   1 mile = 1609.344 meters (exact, international mile)
+        //   1 hour = 3600 seconds
+        //   1 m/s  = 3600 / 1609.344 = 2.2369362920544 mph
+        //
+        // Guards:
+        //   • delta_seconds must be non-null and > 0 (avoid division by zero
+        //     and handle clock glitches where timestamps go backward).
+        //   • delta_meters must be non-null (coordinates were available).
+        //   • If any guard fails, mph_raw is set to NULL.
+        mph_raw = iff(isnotnull(delta_seconds) and delta_seconds > 0 and isnotnull(delta_meters),
+                      (delta_meters / delta_seconds) * 2.2369362920544,
+                      real(null))
+    | extend
+        // ─── Step 7: Apply GPS noise guardrail ───
+        // GPS position can "jump" when the receiver re-acquires satellite
+        // signal (e.g., exiting a tunnel or parking garage).  This causes
+        // large delta_meters in a short delta_seconds, producing artificially
+        // high speed values.
+        //
+        // We cap at 120 MPH — any computed speed above this threshold is
+        // almost certainly a GPS artefact rather than real vehicle motion.
+        // 120 MPH ≈ 193 km/h, which is well above typical highway speeds
+        // but below what GPS jumps commonly produce (often 500+ mph).
+        //
+        // Values exceeding the threshold are set to NULL rather than clamped,
+        // because the underlying distance measurement is unreliable and should
+        // not contribute to averages or totals.
+        mph = iff(isnotnull(mph_raw) and mph_raw <= 120.0, mph_raw, real(null))
+    // ─── Step 8: Select final columns for output ───
+    // Only the columns defined in the MPH_detail table schema are projected.
+    // Intermediate columns (prev_tripId, prev_ts, prev_lat, prev_lon, mph_raw)
+    // are discarded.
+    | project
+        tripId,
+        timestamp,
+        latitude,
+        longitude,
+        altitude,
+        heading,
+        verticalAccuracy,
+        horizontalAccuracy,
+        delta_seconds,
+        delta_meters,
+        mph
+}
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  STEP 3 — Create the update policy on MPH_detail                        ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// An Update Policy in Kusto/Eventhouse is a trigger mechanism that says:
+//   "Whenever new data is ingested into the SOURCE table, automatically
+//    run a QUERY/FUNCTION on the new micro-batch and append the results
+//    to the TARGET table."
+//
+// This makes the pipeline fully incremental — as soon as new GPS data
+// arrives, the speed computation runs automatically without any external
+// scheduler or orchestration.
+//
+// CONFIGURATION FIELDS:
+// ─────────────────────────────────────────────────────────────────────────────
+//   IsEnabled                  : true
+//       The policy is active and will fire on every GPS ingestion.
+//
+//   Source                     : "GPS"
+//       The table that triggers the policy.  Whenever rows are ingested
+//       into GPS, this policy fires.
+//
+//   Query                      : "ComputeMPHDetail()"
+//       The function to execute on the newly ingested micro-batch.
+//       The function sees ONLY the new rows, not the entire GPS table.
+//
+//   IsTransactional            : true
+//       If the function fails (e.g., schema mismatch, runtime error),
+//       the entire GPS ingestion for that batch is also rolled back.
+//       This ensures data consistency: you won't have GPS rows without
+//       corresponding MPH_detail rows.
+//
+//   PropagateIngestionProperties : false
+//       Ingestion-time metadata (tags, extent properties) from the GPS
+//       ingestion are NOT copied to the MPH_detail extents.
+//       Set to true only if you need to trace lineage from MPH_detail
+//       back to the original GPS ingestion batch.
+//
+// IMPORTANT CAVEAT:
+// ─────────────────────────────────────────────────────────────────────────────
+//   Because the function receives only the new micro-batch, the prev()
+//   window function at the BOUNDARY between batches will not have a
+//   "previous" row.  This means the first GPS fix of each micro-batch
+//   will produce NULL for delta_seconds / delta_meters / mph.
+//   In practice this loses at most 1 row per batch per trip — negligible
+//   for continuous 1 Hz data.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Run this command alone.
+
+.alter table MPH_detail policy update
+@'[{"IsEnabled": true, "Source": "GPS", "Query": "ComputeMPHDetail()", "IsTransactional": true, "PropagateIngestionProperties": false}]'
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  STEP 4 — Create the MPH_summary materialized view                      ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// A materialized view in Kusto/Eventhouse pre-computes and INCREMENTALLY
+// maintains an aggregation query.  As new rows arrive in the source table
+// (MPH_detail), the engine automatically updates the aggregated results
+// without re-scanning the entire table from scratch.
+//
+// This is far more efficient than running the aggregation query ad-hoc
+// every time, especially as data grows to millions of rows.
+//
+// AGGREGATED COLUMNS:
+// ─────────────────────────────────────────────────────────────────────────────
+//   row_count         — Total number of GPS fixes (rows) for this trip.
+//                       Useful for understanding trip duration
+//                       (at 1 Hz, row_count ≈ trip duration in seconds).
+//
+//   mph_min           — Minimum speed observed during the trip.
+//                       Note: this includes NULL-excluded values only
+//                       (min() ignores NULLs in KQL).
+//                       A min of 0 or near-0 indicates stops (red lights, etc.).
+//
+//   mph_avg           — Average speed across all non-null readings.
+//                       Useful as a trip-level "cruising speed" indicator.
+//                       Includes time spent stopped (mph ≈ 0) which will
+//                       pull the average down.
+//
+//   mph_max           — Maximum speed observed during the trip.
+//                       Useful for identifying speeding or highway driving.
+//                       Values near 120 should be checked — they may be
+//                       just below the noise guardrail.
+//
+//   mph_nonnull_count — Number of rows where mph is NOT null.
+//                       Compare to row_count to understand data quality:
+//                       (row_count − mph_nonnull_count) = rows lost to
+//                       NULL (trip boundaries, GPS noise, clock glitches).
+//
+//   total_dist_meters — Sum of all delta_meters values for the trip.
+//                       This is the total GPS-measured distance driven,
+//                       in meters.  To convert to miles:
+//                           total_dist_meters / 1609.344
+//                       Note: GPS noise can inflate this value slightly
+//                       because random position jitter accumulates.
+//
+// GROUPING KEY:
+//   tripId            — Each trip gets exactly one summary row.
+//
+// MATERIALIZED VIEW LIMITATIONS:
+// ─────────────────────────────────────────────────────────────────────────────
+//   Only a restricted set of aggregation functions are allowed:
+//     count, countif, sum, min, max, avg, arg_min, arg_max, dcount,
+//     take_any, percentile (with restrictions), etc.
+//
+//   Complex analytics (e.g., percentile distributions, time-windowed
+//   aggregations, joins) must be done as ad-hoc queries against MPH_detail.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Run this command alone.
+
+.create materialized-view MPH_summary on table MPH_detail
+{
+    MPH_detail
+    | summarize
+        row_count         = count(),                    // total GPS fixes in the trip
+        mph_min           = min(mph),                   // slowest recorded speed (mph)
+        mph_avg           = avg(mph),                   // average speed (mph), excl. NULLs
+        mph_max           = max(mph),                   // fastest recorded speed (mph)
+        mph_nonnull_count = countif(isnotnull(mph)),    // fixes with valid speed
+        total_dist_meters = sum(delta_meters)           // total distance driven (meters)
+      by tripId
+}
+
+ 
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  STEP 5 — Backfill MPH_detail from existing GPS data                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// WHY IS THIS NEEDED?
+// ─────────────────────────────────────────────────────────────────────────────
+// The update policy (Step 3) only fires for NEW data ingested into GPS
+// AFTER the policy was created.  Any rows that already existed in the GPS
+// table before the policy was set up will NOT have been processed.
+//
+// This backfill command runs the same computation logic inline (not via the
+// function, to ensure it operates on the FULL GPS table rather than a
+// micro-batch) and appends the results to MPH_detail.
+//
+// COMMAND EXPLANATION:
+// ─────────────────────────────────────────────────────────────────────────────
+//   .set-or-append MPH_detail <| <query>
+//
+//   • .set-or-append — If the table exists, appends results to it.
+//                      If it doesn't exist, creates it with the query's schema.
+//                      (In our case, the table already exists from Step 1.)
+//
+//   • <| — Pipe operator that feeds the query results into the command.
+//
+// The inline query is identical to ComputeMPHDetail() but written out
+// explicitly so that it reads from the FULL GPS table (not a micro-batch).
+// When the update policy calls ComputeMPHDetail(), the function's reference
+// to "GPS" is automatically scoped to only the new micro-batch.
+// Running the same logic inline via .set-or-append reads the full table.
+//
+// WARNING:
+// ─────────────────────────────────────────────────────────────────────────────
+//   Run this ONCE only.  Running it again would create DUPLICATE rows for
+//   data that was already backfilled.  If you need to re-backfill:
+//     1. Truncate the table:  .clear table MPH_detail data
+//     2. Re-run this backfill command.
+//   The materialized view (MPH_summary) will automatically adjust after
+//   truncation and re-backfill.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Run this command alone.
+
+.set-or-append MPH_detail <|
+    GPS
+    // Sort by trip and time for correct prev() ordering
+    | order by tripId asc, timestamp asc
+    // Serialize guarantees deterministic row order for prev()
+    | serialize
+    // Retrieve previous row's values for delta computation
+    | extend
+        prev_tripId = prev(tripId),
+        prev_ts     = prev(timestamp),
+        prev_lat    = prev(latitude),
+        prev_lon    = prev(longitude)
+    | extend
+        // Elapsed time between consecutive GPS fixes (seconds)
+        // datetime - datetime = timespan; divide by 1s to get seconds as real
+        delta_seconds = iff(tripId == prev_tripId and isnotnull(prev_ts),
+                            toreal((timestamp - prev_ts) / 1s),
+                            real(null)),
+        // Geodesic distance between consecutive fixes (meters)
+        // geo_distance_2points(lon1, lat1, lon2, lat2) — note the lon-first parameter order
+        delta_meters  = iff(tripId == prev_tripId
+                            and isnotnull(prev_lat) and isnotnull(prev_lon)
+                            and isnotnull(latitude)  and isnotnull(longitude),
+                            geo_distance_2points(prev_lon, prev_lat, longitude, latitude),
+                            real(null))
+    | extend
+        // Raw speed in mph:  (meters / seconds) × 2.2369362920544
+        mph_raw = iff(isnotnull(delta_seconds) and delta_seconds > 0 and isnotnull(delta_meters),
+                      (delta_meters / delta_seconds) * 2.2369362920544,
+                      real(null))
+    | extend
+        // GPS noise guardrail: cap at 120 mph; anything above is treated as a GPS jump
+        mph = iff(isnotnull(mph_raw) and mph_raw <= 120.0, mph_raw, real(null))
+    // Select only the columns matching the MPH_detail schema
+    | project
+        tripId,
+        timestamp,
+        latitude,
+        longitude,
+        altitude,
+        heading,
+        verticalAccuracy,
+        horizontalAccuracy,
+        delta_seconds,
+        delta_meters,
+        mph
+
+
+// =============================================================================
+// VALIDATION QUERIES
+// =============================================================================
+// Run these AFTER the backfill (Step 5) completes to verify the pipeline
+// is working correctly.  Run each validation query INDIVIDUALLY (not as a batch).
+//
+// These queries are diagnostic — they don't modify any data.
+// =============================================================================
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  VALIDATION 1 — Row counts                                              ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// Compare row counts across the three tables:
+//
+//   GPS          — total raw GPS fixes ingested.
+//   MPH_detail   — should be close to GPS count, but slightly less because
+//                  the first row of each trip has no "previous" reading and
+//                  is still included (with NULL mph).  So row counts should
+//                  be approximately equal.
+//   MPH_summary  — should equal the number of distinct tripIds.
+//
+// If MPH_detail count is MUCH less than GPS, investigate whether the
+// backfill ran successfully or if the update policy is failing.
+// If MPH_detail count is MORE than GPS, you likely ran the backfill twice
+// (duplicates).
+// ─────────────────────────────────────────────────────────────────────────────
+
+GPS | count
+
+MPH_detail | count
+
+MPH_summary | count
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  VALIDATION 2 — Timestamp sanity check                                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// Verifies that GPS timestamps fall within a reasonable date range (2020–2027).
+//
+// WHY THIS MATTERS:
+//   • If timestamps are epoch seconds that were NOT converted to datetime
+//     correctly, they might show dates like 1970-01-01 (Unix epoch) or
+//     dates far in the future.
+//   • If the raw data uses millisecond epochs but the conversion assumes
+//     seconds, dates will be ~50 years in the future.
+//
+// The query computes the min and max timestamp across all GPS data and
+// checks whether they fall within the expected window.
+// ─────────────────────────────────────────────────────────────────────────────
+
+GPS
+| summarize
+    ts_min  = min(timestamp),       // earliest GPS fix in the dataset
+    ts_max  = max(timestamp)        // latest GPS fix in the dataset
+| extend
+    range_check = iff(ts_min >= datetime(2020-01-01) and ts_max <= datetime(2027-01-01),
+                      "OK — timestamps in expected range",
+                      "WARNING — check timestamp values")
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  VALIDATION 3 — MPH distribution (percentiles)                          ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// Provides a statistical overview of the computed speed values:
+//
+//   total_rows  — total rows in MPH_detail.
+//   mph_nonnull — rows with a valid (non-null) mph value.
+//   mph_null    — rows where mph is NULL (first-of-trip, noise, missing coords).
+//                 A high null count relative to total may indicate GPS quality issues.
+//
+//   Percentiles (p25, p50, p75, p95, p99):
+//     p50 (median) gives the "typical" driving speed.
+//     p95/p99 show the upper extreme — if p99 ≈ 120, many readings are
+//     hitting the noise guardrail, suggesting the threshold may need adjustment.
+//
+//   mph_min / mph_max — absolute min and max speed values.
+//     mph_min near 0 is normal (vehicle stopped at lights, parking).
+//     mph_max should be ≤ 120 due to the guardrail.
+//
+// Use this to calibrate the noise guardrail threshold if needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+MPH_detail
+| summarize
+    total_rows   = count(),
+    mph_nonnull  = countif(isnotnull(mph)),
+    mph_null     = countif(isnull(mph)),
+    mph_min      = min(mph),
+    mph_p25      = percentile(mph, 25),       // 25th percentile speed
+    mph_p50      = percentile(mph, 50),       // median speed
+    mph_p75      = percentile(mph, 75),       // 75th percentile speed
+    mph_p95      = percentile(mph, 95),       // 95th percentile — near highway speed
+    mph_p99      = percentile(mph, 99),       // 99th percentile — upper extreme
+    mph_max      = max(mph)                   // absolute maximum (should be ≤ 120)
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  VALIDATION 4 — Top 20 trips by max speed                               ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// Lists the 20 trips with the highest recorded speed, showing:
+//   tripId, total fixes (row_count), min/avg/max speed, and non-null count.
+//
+// PURPOSE:
+//   • Identify trips that involved highway driving (mph_max 60–80).
+//   • Spot potential GPS noise issues (mph_max near 120 with low mph_avg
+//     suggests a single GPS jump inflated the max).
+//   • Compare mph_nonnull_count to row_count to check data completeness.
+//
+// Values are rounded to 2 decimal places for readability.
+// ─────────────────────────────────────────────────────────────────────────────
+
+MPH_summary
+| top 20 by mph_max desc
+| project tripId, row_count, mph_min = round(mph_min, 2), mph_avg = round(mph_avg, 2),
+          mph_max = round(mph_max, 2), mph_nonnull_count
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  VALIDATION 5 — Inspect the highest-speed trip                          ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// Drills into the single trip with the highest max speed and shows every
+// GPS fix in chronological order.
+//
+// This lets you:
+//   • See the speed profile over time (accelerating, cruising, braking).
+//   • Identify GPS jumps (sudden spike in dist_m / mph followed by a drop).
+//   • Verify that delta_seconds is consistent (~1.0 for 1 Hz GPS).
+//   • Check lat/lon coordinates to see if the route makes geographic sense.
+//
+// HOW IT WORKS:
+//   toscalar() — Executes the inner query and returns a single scalar value
+//                (the tripId of the fastest trip).  This is used as a filter
+//                in the main query.
+//
+//   Unlike the Quaternion pipeline's "let top_trip = ..." tabular approach,
+//   here we use toscalar() because we need a single string value for the
+//   equality comparison (tripId == top_trip).
+// ─────────────────────────────────────────────────────────────────────────────
+
+let top_trip = toscalar(MPH_summary | top 1 by mph_max desc | project tripId);
+MPH_detail
+| where tripId == top_trip
+| order by timestamp asc
+| project tripId, timestamp, latitude, longitude,
+          dt_sec  = round(delta_seconds, 3),    // time gap from previous fix (seconds)
+          dist_m  = round(delta_meters, 2),     // distance from previous fix (meters)
+          mph     = round(mph, 2)               // speed (mph), rounded for readability
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  VALIDATION 6 — Timestamp gaps > 5 seconds (lost GPS fixes)             ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// GPS receivers can lose satellite lock (tunnels, parking garages, dense
+// urban canyons), causing gaps in the data stream.  This query identifies
+// trips with gaps longer than 5 seconds.
+//
+//   gap_count   — number of times a gap > 5s occurred in each trip.
+//   max_gap_sec — the longest single gap (in seconds) within the trip.
+//   avg_gap_sec — average duration of the gaps > 5s.
+//
+// WHY THIS MATTERS:
+//   • Large gaps inflate delta_meters (the GPS fix after the gap may be
+//     far from the fix before it), but the speed calculation handles this
+//     correctly because delta_seconds is also large — so mph stays reasonable.
+//   • However, total_dist_meters in the summary may be UNDERSTATED during
+//     long gaps because the GPS does not record the actual path driven.
+//   • Trips with many large gaps may have unreliable average speed.
+//
+// The top 20 trips by longest gap are shown.  If max_gap_sec is very large
+// (e.g., 3600+ seconds = 1+ hour), it likely means the trip was paused
+// (e.g., phone turned off mid-drive) and may need to be split into
+// separate trips during data cleaning.
+// ─────────────────────────────────────────────────────────────────────────────
+
+MPH_detail
+| where delta_seconds > 5
+| summarize
+    gap_count   = count(),                          // number of gaps > 5s
+    max_gap_sec = round(max(delta_seconds), 2),     // longest gap (seconds)
+    avg_gap_sec = round(avg(delta_seconds), 2)      // average gap duration (seconds)
+  by tripId
+| top 20 by max_gap_sec desc
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  FINAL CHECK — View the materialized summary                            ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+//
+// Simple query to view the full MPH_summary materialized view.
+// Each row represents one trip with its aggregated speed statistics
+// and total distance.  This view updates automatically as new data flows
+// through the pipeline.
+// ─────────────────────────────────────────────────────────────────────────────
+
+MPH_summary

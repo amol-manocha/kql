@@ -1,0 +1,747 @@
+// =============================================================================
+// Driving Events Pipeline — KQL (Eventhouse: jsonload)
+// Workspace: "telematics json"
+//
+// =============================================================================
+// OVERVIEW
+// =============================================================================
+// This script implements an end-to-end pipeline for detecting dangerous driving
+// events from smartphone IMU (Inertial Measurement Unit) quaternion data.
+//
+// The smartphone is mounted inside a moving vehicle and continuously reports
+// its orientation as a quaternion (w, x, y, z) at ~5 readings per second.
+// By comparing consecutive orientations we can infer how fast the phone (and
+// therefore the vehicle) is rotating, and in which direction.
+//
+// =============================================================================
+// DATA FLOW
+// =============================================================================
+//   RawTelematicsData  →  Quaternion  →  DrivingEvents_detail
+//                                        └→  DrivingEvents_summary  (materialized view)
+//
+//   • RawTelematicsData : Raw JSON ingested from the phone.
+//   • Quaternion        : Cleaned table with (tripId, timestamp, w, x, y, z).
+//   • DrivingEvents_detail : One row per second per trip, with angular rates
+//                            and boolean flags for detected events.
+//   • DrivingEvents_summary : Materialized aggregation per tripId (counts,
+//                             min/max rates) that stays current automatically.
+//
+// =============================================================================
+// WHAT IS A QUATERNION?
+// =============================================================================
+// A quaternion is a 4-component number (w, x, y, z) that represents a 3-D
+// rotation.  It is the standard representation used by phone sensors
+// (Android / iOS rotation vector) because:
+//
+//   1. It is free from **gimbal lock** — the pathological singularity that
+//      occurs when two rotation axes align (e.g., pitch ≈ ±90°).
+//   2. Interpolation (SLERP) is smooth and well-defined.
+//   3. Composition of rotations is a simple quaternion multiplication.
+//
+// A unit quaternion q = (w, x, y, z) satisfies  w² + x² + y² + z² = 1.
+// The scalar part  w = cos(θ/2)  encodes half the rotation angle θ,
+// and the vector part  (x, y, z) = sin(θ/2) * (axis)  encodes the rotation axis.
+//
+// IMPORTANT:  q and −q represent the *same* rotation.  This "double cover"
+// must be handled explicitly when averaging or differencing quaternions
+// (see sign-normalisation step below).
+//
+// =============================================================================
+// WHY NOT EULER ANGLES?
+// =============================================================================
+// When the phone lies flat on its side (common car mount orientations),
+// the pitch axis can reach ≈ −90°, which is precisely where Euler-angle
+// gimbal lock occurs.  At gimbal lock, yaw and roll become mathematically
+// coupled and can jump wildly, making angular-rate estimates unreliable.
+//
+// Quaternion-based relative rotation avoids this issue entirely because the
+// computation never passes through an Euler-angle representation.
+//
+// =============================================================================
+// DETECTED DRIVING EVENTS
+// =============================================================================
+// The pipeline classifies three types of driving events by projecting the
+// angular velocity vector onto meaningful physical axes:
+//
+//   • Sharp Turn          — |yaw_rate| > 20 °/s
+//       Yaw rate is rotation around the gravity axis (vertical).
+//       When the car turns left or right, the phone yaws.
+//
+//   • Hard Stop (Braking) — pitch_rate > 15 °/s   (positive = forward tilt)
+//       When the driver brakes hard, the phone tilts forward
+//       in the direction of travel.
+//
+//   • Aggressive Accel    — pitch_rate < −15 °/s   (negative = backward tilt)
+//       Rapid acceleration pushes the phone backward.
+//
+// =============================================================================
+// HOW TO RUN
+// =============================================================================
+// Run each numbered section (1 through 6) one at a time in the Eventhouse
+// query editor.  Sections 1–5 set up the schema, function, update policy,
+// materialized view, and backfill.  Section 6 contains validation queries
+// to verify correctness.
+// =============================================================================
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1:  CREATE THE OUTPUT TABLE — DrivingEvents_detail
+// ─────────────────────────────────────────────────────────────────────────────
+// This table stores one row per (tripId, second) with the computed angular
+// rates and boolean driving-event flags.
+//
+// Column descriptions:
+//   tripId                  — Unique identifier for a driving trip/session.
+//   timestamp               — The 1-second bucket timestamp (datetime).
+//                             The raw data stores epoch seconds; they are
+//                             converted to KQL datetime during ingestion.
+//   w, x, y, z             — The averaged, renormalised unit quaternion for
+//                             this 1-second window.
+//   samples_per_sec         — How many raw sensor readings fell into this
+//                             1-second bucket (typically ~5 at 5 Hz).
+//   delta_seconds           — Elapsed time (seconds) between this row and the
+//                             previous row for the same trip.  Should be ~1.0.
+//   total_angular_rate_dps  — Total angular speed (degrees per second) between
+//                             the previous and current orientation, computed
+//                             from the axis-angle decomposition of the
+//                             relative quaternion.
+//   yaw_rate_dps            — Component of angular velocity around the gravity
+//                             axis (vertical).  Positive = clockwise when
+//                             viewed from above (right turn).
+//   tilt_rate_dps           — Magnitude of angular velocity in the plane
+//                             perpendicular to gravity (how fast the phone
+//                             is tilting — combines pitch and roll).
+//   pitch_rate_dps          — Signed component of angular velocity along the
+//                             "right" axis of the phone's horizontal forward
+//                             direction.  Positive = forward tilt (braking),
+//                             Negative = backward tilt (acceleration).
+//   is_sharp_turn           — True if |yaw_rate_dps| > 20 °/s.
+//   is_hard_stop            — True if pitch_rate_dps > 15 °/s.
+//   is_aggressive_accel     — True if pitch_rate_dps < −15 °/s.
+// ─────────────────────────────────────────────────────────────────────────────
+.create table DrivingEvents_detail (
+    tripId: string,
+    timestamp: datetime,            // was long — now datetime (epoch seconds → datetime)
+    w: real,
+    x: real,
+    y: real,
+    z: real,
+    samples_per_sec: int,
+    delta_seconds: real,
+    total_angular_rate_dps: real,
+    yaw_rate_dps: real,
+    tilt_rate_dps: real,
+    pitch_rate_dps: real,
+    is_sharp_turn: bool,
+    is_hard_stop: bool,
+    is_aggressive_accel: bool
+)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 2:  CREATE THE COMPUTATION FUNCTION — ComputeDrivingEventsDetail()
+// ─────────────────────────────────────────────────────────────────────────────
+// This function reads from the "Quaternion" source table and performs the
+// full mathematical pipeline to produce driving-event rows.
+//
+// HIGH-LEVEL ALGORITHM:
+//   a) Sign-normalise quaternions so averaging is meaningful.
+//   b) Average ~5 readings per second down to 1 per (tripId, timestamp).
+//   c) Renormalise the averaged quaternion back to unit length.
+//   d) Compute the relative quaternion between consecutive timestamps.
+//   e) Extract the axis-angle representation → angular velocity vector.
+//   f) Project ω (angular velocity) onto the gravity axis → yaw_rate.
+//   g) Compute the perpendicular component → tilt_rate.
+//   h) Further decompose tilt into signed pitch_rate along the vehicle's
+//      forward direction → braking vs. acceleration.
+//   i) Apply noise guardrails and classify events.
+//
+// The function is designed to be called by an update policy (Section 3) so
+// that it fires automatically on each new micro-batch of ingested data.
+// ─────────────────────────────────────────────────────────────────────────────
+.create-or-alter function ComputeDrivingEventsDetail() {
+
+    // =====================================================================
+    // THRESHOLDS (degrees per second)
+    // =====================================================================
+    // These constants define the sensitivity of each driving event detector.
+    // They can be tuned based on the percentile analysis in Section 6d.
+    //
+    //   SHARP_TURN_THRESHOLD       : |yaw_rate| must exceed this to flag a turn.
+    //   HARD_STOP_THRESHOLD        : pitch_rate (positive = braking) must exceed this.
+    //   AGGRESSIVE_ACCEL_THRESHOLD : pitch_rate (negative = accelerating) must be
+    //                                below this (more negative).
+    //   MAX_ANGULAR_RATE           : Any row with total angular rate above this is
+    //                                treated as sensor noise / glitch and nullified.
+    // =====================================================================
+    let SHARP_TURN_THRESHOLD = 20.0;        // degrees/sec — yaw around gravity
+    let HARD_STOP_THRESHOLD = 15.0;         // degrees/sec — forward pitch (braking)
+    let AGGRESSIVE_ACCEL_THRESHOLD = -15.0; // degrees/sec — backward pitch (acceleration)
+    let MAX_ANGULAR_RATE = 500.0;           // degrees/sec — noise ceiling
+
+    // =====================================================================
+    // STEP (a–c):  SIGN-NORMALISE, AVERAGE PER SECOND, RENORMALISE
+    // =====================================================================
+    //
+    // SIGN NORMALISATION (step a):
+    //   Because q and −q represent the same rotation, naïve averaging of raw
+    //   quaternions can cancel out (imagine averaging q and −q → zero vector).
+    //   We flip any quaternion whose scalar part w < 0 so that all quaternions
+    //   in a window lie in the same hemisphere.  This is the standard technique
+    //   for quaternion mean estimation.
+    //
+    // AVERAGING (step b):
+    //   The phone reports ~5 readings per second.  We compute the
+    //   component-wise mean of the sign-normalised quaternions grouped by
+    //   (tripId, timestamp).  This gives a single representative orientation
+    //   per second, smoothing out high-frequency jitter.
+    //
+    // RENORMALISATION (step c):
+    //   After averaging, the resulting quaternion is generally NOT unit-length.
+    //   We divide each component by the quaternion's norm to restore the
+    //   constraint  w² + x² + y² + z² = 1.
+    //
+    // =====================================================================
+    let averaged =
+        Quaternion
+        // --- (a) Flip quaternion so w ≥ 0 (same hemisphere) ---
+        | extend sign = iff(w < 0, -1.0, 1.0)
+        | extend ws = w * sign, xs = x * sign, ys = y * sign, zs = z * sign
+        // --- (b) Average the sign-normalised components per second ---
+        | summarize
+            wa = avg(ws), xa = avg(xs), ya = avg(ys), za = avg(zs),
+            samples = count()            // track how many raw readings contributed
+          by tripId, timestamp           // one row per trip per second
+        // --- (c) Renormalise to unit quaternion ---
+        | extend qn = sqrt(wa*wa + xa*xa + ya*ya + za*za)   // quaternion norm
+        | extend w = wa/qn, x = xa/qn, y = ya/qn, z = za/qn
+        | project tripId, timestamp, w, x, y, z, samples;
+
+    // =====================================================================
+    // STEP (d):  COMPUTE RELATIVE QUATERNION BETWEEN CONSECUTIVE READINGS
+    // =====================================================================
+    //
+    // We sort each trip chronologically and use prev() to access the
+    // immediately preceding row.  The relative quaternion tells us
+    // "how much did the phone rotate between time t−1 and time t?"
+    //
+    // MATH:
+    //   If q_prev is the orientation at t−1 and q_curr at t, then
+    //
+    //       q_rel = conj(q_prev) × q_curr
+    //
+    //   where conj(q) = (w, −x, −y, −z) is the quaternion conjugate
+    //   (same as inverse for unit quaternions).
+    //
+    //   q_rel encodes the rotation FROM the previous body frame TO the
+    //   current body frame.  Its axis-angle decomposition gives us the
+    //   rotation axis and the rotation angle between the two instants.
+    //
+    // QUATERNION MULTIPLICATION FORMULA:
+    //   Given p = (pw, px, py, pz) and q = (w, x, y, z),
+    //   conj(p) × q is:
+    //       rw =  pw*w + px*x + py*y + pz*z
+    //       rx = -px*w + pw*x + py*z - pz*y
+    //       ry = -py*w + pw*y - px*z + pz*x
+    //       rz = -pz*w + pw*z + px*y - py*x
+    //
+    //   (This is Hamilton product with conjugated left operand.)
+    //
+    // DELTA TIME (dt):
+    //   Computed as the difference in datetime between consecutive rows
+    //   within the same trip.  We skip the first row of each trip because
+    //   there is no "previous" reading to compare with.
+    //
+    // =====================================================================
+    averaged
+    | order by tripId asc, timestamp asc
+    | serialize                         // required for prev() window function
+    | extend
+        prev_trip = prev(tripId),       // tripId of the prior row
+        prev_ts   = prev(timestamp),    // timestamp of the prior row
+        pw = prev(w), px = prev(x), py = prev(y), pz = prev(z)  // previous quaternion
+    // Compute elapsed time in seconds.
+    // (datetime − datetime) yields a timespan; dividing by 1s converts to real.
+    | extend dt = iff(tripId == prev_trip and isnotnull(prev_ts),
+                      toreal((timestamp - prev_ts) / 1s), real(null))
+    // Drop first row of each trip (no previous reading) and zero-dt rows.
+    | where isnotnull(dt) and dt > 0
+
+    // --- Relative quaternion:  q_rel = conj(q_prev) × q_curr ---
+    | extend
+        rw =  pw*w + px*x + py*y + pz*z,
+        rx = -px*w + pw*x + py*z - pz*y,
+        ry = -py*w + pw*y - px*z + pz*x,
+        rz = -pz*w + pw*z + px*y - py*x
+
+    // =====================================================================
+    // SHORTEST-PATH CORRECTION
+    // =====================================================================
+    // q_rel and −q_rel represent the same rotation but different "winding"
+    // (one goes the short way, the other the long way around the sphere).
+    // We always want the shorter rotation, which corresponds to rw ≥ 0
+    // (i.e., rotation angle ≤ 180°).  If rw < 0, negate the whole quaternion.
+    // =====================================================================
+    | extend
+        rw_s = iff(rw < 0, -rw, rw),
+        rx_s = iff(rw < 0, -rx, rx),
+        ry_s = iff(rw < 0, -ry, ry),
+        rz_s = iff(rw < 0, -rz, rz)
+
+    // =====================================================================
+    // STEP (e):  AXIS-ANGLE DECOMPOSITION
+    // =====================================================================
+    //
+    // Any unit quaternion can be written as:
+    //     q = ( cos(θ/2),  sin(θ/2) * axis )
+    //
+    // where θ is the rotation angle and "axis" is the unit rotation axis.
+    //
+    //   half_angle = acos(rw_s)        →  θ/2
+    //   angle_rad  = 2 * half_angle    →  θ  (full rotation angle in radians)
+    //   total_rate = (θ in degrees) / dt   →  angular speed in degrees/sec
+    //
+    //   axis = (rx_s, ry_s, rz_s) / sin(half_angle)
+    //          (normalise the vector part to get a unit rotation axis)
+    //
+    // The angular velocity vector ω (in degrees/sec) is then:
+    //     ω = axis * total_rate
+    //
+    // This vector tells us BOTH the direction and speed of rotation.
+    // We will then project it onto meaningful physical directions (gravity,
+    // forward) to extract yaw and pitch rates.
+    //
+    // Guard: when the rotation angle is near zero (< 1e-8 rad ≈ 0.00006°),
+    //        the axis is undefined; we set angular velocity to zero.
+    // =====================================================================
+    | extend rw_c = iff(rw_s > 1.0, 1.0, rw_s)    // clamp to [-1,1] for acos safety
+    | extend half_angle = acos(rw_c)                // half the rotation angle (radians)
+    | extend angle_rad  = 2.0 * half_angle          // full rotation angle (radians)
+    | extend total_rate = iff(angle_rad > 1e-8,
+                              (angle_rad * 180.0 / pi()) / dt, 0.0) // convert to °/s
+    | extend sin_half   = sin(half_angle)
+    | extend has_axis   = sin_half > 1e-8           // is the rotation axis well-defined?
+
+    // --- Rotation axis (unit vector, expressed in the PREVIOUS body frame) ---
+    | extend
+        ax = iff(has_axis, rx_s / sin_half, 0.0),
+        ay = iff(has_axis, ry_s / sin_half, 0.0),
+        az = iff(has_axis, rz_s / sin_half, 0.0)
+
+    // --- Angular velocity vector ω (degrees/sec, in previous body frame) ---
+    // Each component tells us how much rotation is happening around that body axis.
+    | extend ox = ax * total_rate, oy = ay * total_rate, oz = az * total_rate
+
+    // =====================================================================
+    // STEP (f):  COMPUTE GRAVITY DIRECTION IN THE BODY FRAME
+    // =====================================================================
+    //
+    // To separate "turning" (yaw) from "tilting" (pitch/roll), we need to
+    // know which direction gravity points in the phone's coordinate frame.
+    //
+    // We assume the phone sensor reports orientation relative to an
+    // earth-fixed frame where Z is up (ENU or NED-like).
+    //
+    // The gravity vector in earth frame is g_earth = (0, 0, −1)  (Z-up, g down).
+    //
+    // To transform g_earth into the phone's body frame, we apply the inverse
+    // rotation of the phone's orientation quaternion:
+    //
+    //     g_body = q_prev⁻¹ ⊗ g_earth ⊗ q_prev     (quaternion sandwich)
+    //
+    // Expanding the quaternion rotation matrix for g = (0, 0, −1):
+    //     gx =  2(w·y − x·z)        [using pw,px,py,pz for q_prev]
+    //     gy = −2(w·x + y·z)
+    //     gz =  2(x² + y²) − 1
+    //
+    // (These formulas come from the third column of the rotation matrix
+    //  R(q), negated because g = −ẑ.)
+    //
+    // We then normalise g_body to unit length for numerical safety.
+    // =====================================================================
+    | extend
+        gx_r =  2.0*pw*py - 2.0*px*pz,      // gravity X component in body frame
+        gy_r = -2.0*pw*px - 2.0*py*pz,       // gravity Y component in body frame
+        gz_r =  2.0*px*px + 2.0*py*py - 1.0  // gravity Z component in body frame
+    | extend gmag = sqrt(gx_r*gx_r + gy_r*gy_r + gz_r*gz_r)  // should be ≈ 1.0
+    | extend
+        gx = iff(gmag > 1e-6, gx_r/gmag, 0.0),   // normalised gravity X
+        gy = iff(gmag > 1e-6, gy_r/gmag, 0.0),   // normalised gravity Y
+        gz = iff(gmag > 1e-6, gz_r/gmag, 0.0)    // normalised gravity Z
+
+    // =====================================================================
+    // YAW RATE  =  ω · gravity   (dot product)
+    // =====================================================================
+    // The yaw rate is the component of angular velocity that is aligned
+    // with gravity — i.e., rotation around the vertical axis.
+    //
+    // This corresponds to the vehicle *turning* left or right.
+    //
+    //   Positive yaw_rate  →  rotating clockwise when viewed from above
+    //   Negative yaw_rate  →  rotating counter-clockwise
+    //
+    // By projecting ω onto the gravity vector, we isolate only the
+    // "steering" component, regardless of how the phone is mounted.
+    // =====================================================================
+    | extend yaw_raw = ox*gx + oy*gy + oz*gz     // scalar projection onto gravity
+
+    // =====================================================================
+    // STEP (g):  TILT RATE  =  |ω − yaw·g|   (magnitude)
+    // =====================================================================
+    // The tilt rate is the component of angular velocity PERPENDICULAR to
+    // gravity — i.e., all rotation that is NOT yaw.  This captures how fast
+    // the phone is changing its tilt relative to the vertical.
+    //
+    // We compute it by subtracting the yaw component from ω and taking
+    // the magnitude of the remainder:
+    //
+    //     ω_tilt = ω − (ω · g) * g
+    //     tilt_rate = |ω_tilt|
+    //
+    // In a vehicle context, tilt rate combines pitch (forward/backward tilt
+    // from braking/acceleration) and roll (side-to-side tilt from road camber
+    // or hard cornering).
+    // =====================================================================
+    | extend tx = ox - yaw_raw*gx, ty = oy - yaw_raw*gy, tz = oz - yaw_raw*gz
+    | extend tilt_raw = sqrt(tx*tx + ty*ty + tz*tz)
+
+    // =====================================================================
+    // STEP (h):  SIGNED PITCH RATE (BRAKING vs. ACCELERATION)
+    // =====================================================================
+    //
+    // Tilt rate is unsigned — it doesn't tell us whether the phone tilted
+    // forward (braking) or backward (acceleration).  To distinguish, we need
+    // to define a "forward" direction and compute the signed pitch.
+    //
+    // APPROACH:
+    //   1. Assume the phone's Y-axis points roughly in the vehicle's forward
+    //      direction (standard Android/iOS convention for landscape mount).
+    //      In the body frame this is the vector (0, 1, 0).
+    //
+    //   2. Project this Y-axis onto the horizontal plane (remove the gravity
+    //      component) to get the horizontal forward direction:
+    //
+    //          f_horizontal = Y_body − (Y_body · g) * g
+    //          f_hat = normalise(f_horizontal)
+    //
+    //   3. Define the "right" axis as the cross product:
+    //          right = f_hat × g
+    //
+    //      This gives a horizontal axis pointing to the vehicle's right.
+    //
+    //   4. The pitch rate is the component of ω along the "right" axis:
+    //          pitch_rate = ω · right
+    //
+    //      Positive pitch_rate means the phone is rotating "nose down"
+    //      (forward tilt → braking).
+    //      Negative pitch_rate means "nose up" (backward tilt → acceleration).
+    //
+    // NOTE: If the horizontal projection of the phone's Y-axis is degenerate
+    //       (phone pointing straight up/down), fhm ≈ 0 and pitch defaults to 0.
+    // =====================================================================
+
+    // --- Project phone Y-axis (0,1,0) onto horizontal plane ---
+    | extend fdg = gy       // dot product of (0,1,0) with gravity = gy
+    // Remove gravity component:  f_horiz = (0,1,0) − (gy) * g
+    | extend fhx = -fdg * gx, fhy = 1.0 - fdg * gy, fhz = -fdg * gz
+    | extend fhm = sqrt(fhx*fhx + fhy*fhy + fhz*fhz)   // magnitude
+    // Normalise to get unit forward-horizontal vector
+    | extend
+        fhxn = iff(fhm > 1e-6, fhx/fhm, 0.0),
+        fhyn = iff(fhm > 1e-6, fhy/fhm, 0.0),
+        fhzn = iff(fhm > 1e-6, fhz/fhm, 0.0)
+
+    // --- Right axis = forward_horizontal × gravity (cross product) ---
+    | extend
+        rightx = fhyn*gz - fhzn*gy,
+        righty = fhzn*gx - fhxn*gz,
+        rightz = fhxn*gy - fhyn*gx
+
+    // --- Pitch rate = ω · right  (signed scalar) ---
+    //     Positive → forward tilt → braking
+    //     Negative → backward tilt → acceleration
+    | extend pitch_raw = iff(fhm > 1e-6, ox*rightx + oy*righty + oz*rightz, 0.0)
+
+    // =====================================================================
+    // STEP (i):  NOISE GUARDRAIL, ROUNDING & EVENT CLASSIFICATION
+    // =====================================================================
+    //
+    // NOISE GUARDRAIL:
+    //   Any row where the total angular rate exceeds MAX_ANGULAR_RATE (500 °/s)
+    //   is almost certainly a sensor glitch or numerical artefact (e.g., from
+    //   a missed reading creating a tiny dt).  We null out all rate columns
+    //   for such rows and do NOT classify them as events.
+    //
+    // ROUNDING:
+    //   Rates are rounded to 4 decimal places for cleaner storage and display.
+    //
+    // EVENT CLASSIFICATION:
+    //   • is_sharp_turn       — |yaw_rate| > SHARP_TURN_THRESHOLD  (20 °/s)
+    //   • is_hard_stop        — pitch_rate > HARD_STOP_THRESHOLD   (15 °/s)
+    //   • is_aggressive_accel — pitch_rate < AGGRESSIVE_ACCEL_THRESHOLD (−15 °/s)
+    //
+    //   Noise-flagged rows always get false for all event booleans.
+    // =====================================================================
+    | extend is_noise = total_rate > MAX_ANGULAR_RATE
+    | extend
+        total_angular_rate_dps = iff(is_noise, real(null), round(total_rate, 4)),
+        yaw_rate_dps           = iff(is_noise, real(null), round(yaw_raw, 4)),
+        tilt_rate_dps          = iff(is_noise, real(null), round(tilt_raw, 4)),
+        pitch_rate_dps         = iff(is_noise, real(null), round(pitch_raw, 4))
+    // --- Classify events (only for non-noise rows) ---
+    | extend
+        is_sharp_turn       = iff(is_noise, false, abs(yaw_raw) > SHARP_TURN_THRESHOLD),
+        is_hard_stop        = iff(is_noise, false, pitch_raw > HARD_STOP_THRESHOLD),
+        is_aggressive_accel = iff(is_noise, false, pitch_raw < AGGRESSIVE_ACCEL_THRESHOLD)
+
+    // =====================================================================
+    // FINAL PROJECTION — select and rename columns for the output table
+    // =====================================================================
+    | project
+        tripId, timestamp, w, x, y, z,
+        samples_per_sec = toint(samples),   // number of raw quaternion readings averaged
+        delta_seconds   = round(dt, 3),     // time gap from previous reading (seconds)
+        total_angular_rate_dps,             // total rotation speed (°/s)
+        yaw_rate_dps,                       // rotation around gravity (°/s) — turning
+        tilt_rate_dps,                      // rotation perpendicular to gravity (°/s)
+        pitch_rate_dps,                     // signed pitch rate (°/s) — brake/accel
+        is_sharp_turn,                      // event flag: sharp turn detected
+        is_hard_stop,                       // event flag: hard braking detected
+        is_aggressive_accel                 // event flag: aggressive acceleration detected
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 3:  SET UPDATE POLICY — Quaternion → DrivingEvents_detail
+// ─────────────────────────────────────────────────────────────────────────────
+// An Update Policy in Kusto/Eventhouse tells the engine:
+//   "Whenever new data is ingested into the SOURCE table (Quaternion),
+//    automatically run this QUERY (ComputeDrivingEventsDetail) on the new
+//    micro-batch and append the results to the TARGET table
+//    (DrivingEvents_detail)."
+//
+// This means the pipeline runs continuously and incrementally — there is no
+// need to schedule batch jobs.
+//
+// Configuration options:
+//   IsEnabled             : true  → policy is active.
+//   Source                : "Quaternion" — the table that triggers the policy.
+//   Query                 : "ComputeDrivingEventsDetail()" — the function to run.
+//   IsTransactional       : true  → if the function fails, the source ingestion
+//                           also fails (ensures data consistency).
+//   PropagateIngestionProperties : false — ingestion tags/properties from the
+//                           source are NOT copied to the target.
+//
+// NOTE: The update policy function receives only the NEWLY ingested rows as
+//       input (not the entire Quaternion table).  This is important to
+//       understand for correctness — the prev() window function operates
+//       within the micro-batch, so boundary rows between batches will NOT
+//       have a previous reading and will be dropped (this is acceptable
+//       because it loses at most one second per ingestion batch).
+// ─────────────────────────────────────────────────────────────────────────────
+.alter table DrivingEvents_detail policy update
+@'[{"IsEnabled": true, "Source": "Quaternion", "Query": "ComputeDrivingEventsDetail()", "IsTransactional": true, "PropagateIngestionProperties": false}]'
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 4:  CREATE MATERIALIZED VIEW — DrivingEvents_summary
+// ─────────────────────────────────────────────────────────────────────────────
+// A materialized view in Kusto/Eventhouse pre-computes and incrementally
+// maintains an aggregation query.  As new rows arrive in the source table
+// (DrivingEvents_detail), the view automatically updates the aggregated
+// results without re-scanning the entire table.
+//
+// This view produces ONE summary row per tripId with:
+//   row_count              — total number of 1-second readings for the trip.
+//   sharp_turn_count       — number of seconds flagged as sharp turns.
+//   hard_stop_count        — number of seconds flagged as hard stops.
+//   aggressive_accel_count — number of seconds flagged as aggressive acceleration.
+//   max/min_yaw_rate_dps   — peak yaw rates (most extreme turns left/right).
+//   max/min_pitch_rate_dps — peak pitch rates (hardest brake / fastest accel).
+//   max_tilt_rate_dps      — peak tilt rate.
+//
+// LIMITATION: Materialized views only support a restricted set of aggregation
+//             functions (count, countif, sum, min, max, avg, arg_min, arg_max,
+//             dcount, etc.).  More complex analytics (percentiles, top-N, etc.)
+//             must be done as ad-hoc queries against the detail table.
+// ─────────────────────────────────────────────────────────────────────────────
+.create materialized-view DrivingEvents_summary on table DrivingEvents_detail
+{
+    DrivingEvents_detail
+    | summarize
+        row_count              = count(),                         // total seconds of data
+        sharp_turn_count       = countif(is_sharp_turn),          // seconds with sharp turn
+        hard_stop_count        = countif(is_hard_stop),           // seconds with hard braking
+        aggressive_accel_count = countif(is_aggressive_accel),    // seconds with hard accel
+        max_yaw_rate_dps       = max(yaw_rate_dps),               // most extreme right turn rate
+        min_yaw_rate_dps       = min(yaw_rate_dps),               // most extreme left turn rate
+        max_pitch_rate_dps     = max(pitch_rate_dps),             // hardest braking moment
+        min_pitch_rate_dps     = min(pitch_rate_dps),             // hardest acceleration moment
+        max_tilt_rate_dps      = max(tilt_rate_dps)               // peak overall tilt change
+      by tripId
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 5:  ONE-TIME BACKFILL
+// ─────────────────────────────────────────────────────────────────────────────
+// The update policy (Section 3) only fires for NEWLY ingested data going
+// forward.  Any rows that were already present in the Quaternion table before
+// the policy was created will NOT have been processed.
+//
+// This command runs the function once against the full Quaternion table and
+// appends the results to DrivingEvents_detail.
+//
+//   .set-or-append  — appends to the table if it already exists (does NOT
+//                     truncate).  If the table does not exist, it creates it.
+//
+// WARNING: Run this ONCE only.  Running it again would create duplicate rows
+//          for the already-backfilled data.  If you need to re-backfill,
+//          first truncate DrivingEvents_detail with:
+//              .clear table DrivingEvents_detail data
+// ─────────────────────────────────────────────────────────────────────────────
+.set-or-append DrivingEvents_detail <| ComputeDrivingEventsDetail()
+
+
+// =============================================================================
+// SECTION 6:  VALIDATION QUERIES
+// =============================================================================
+// These queries are for manual verification and exploration.
+// Run them individually (not as a batch) after the backfill completes.
+// =============================================================================
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6a — ROW COUNT
+// ─────────────────────────────────────────────────────────────────────────────
+// Simple sanity check: how many detail rows were produced?
+// Compare this to the Quaternion table row count.  You should have roughly
+// (Quaternion rows / samples_per_sec) − (number of trips) rows, because
+// we average per second and lose the first row of each trip.
+// ─────────────────────────────────────────────────────────────────────────────
+DrivingEvents_detail | count
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6b — PER-TRIP SUMMARY OVERVIEW
+// ─────────────────────────────────────────────────────────────────────────────
+// Pulls from the materialized view and adds derived fields:
+//   total_events      — sum of all three event types per trip.
+//   peak_yaw_rate_dps — the larger of max_yaw (right turn) or −min_yaw (left turn),
+//                       giving the absolute peak regardless of direction.
+//
+// Ordered by total_events descending so the "worst" trips appear first.
+// ─────────────────────────────────────────────────────────────────────────────
+DrivingEvents_summary
+| extend total_events = sharp_turn_count + hard_stop_count + aggressive_accel_count
+| extend peak_yaw_rate_dps = max_of(max_yaw_rate_dps, -min_yaw_rate_dps)
+| project tripId, row_count,
+          sharp_turn_count, hard_stop_count, aggressive_accel_count, total_events,
+          peak_yaw_rate_dps, max_pitch_rate_dps, min_pitch_rate_dps, max_tilt_rate_dps
+| order by total_events desc
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6c — AGGREGATE TOTALS ACROSS ALL TRIPS
+// ─────────────────────────────────────────────────────────────────────────────
+// Fleet-level statistics:
+//   total_trips              — number of distinct trips in the data.
+//   total_sharp_turns/...    — total event counts across all trips.
+//   avg_sharp_turns/...      — average number of events per trip.
+//
+// Useful for benchmarking: "On average, a trip has X hard stops."
+// ─────────────────────────────────────────────────────────────────────────────
+DrivingEvents_summary
+| summarize
+    total_trips              = dcount(tripId),
+    total_sharp_turns        = sum(sharp_turn_count),
+    total_hard_stops         = sum(hard_stop_count),
+    total_aggressive_accels  = sum(aggressive_accel_count),
+    avg_sharp_turns          = round(avg(toreal(sharp_turn_count)), 2),
+    avg_hard_stops           = round(avg(toreal(hard_stop_count)), 2),
+    avg_aggressive_accels    = round(avg(toreal(aggressive_accel_count)), 2)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6d — ANGULAR RATE PERCENTILES (FOR THRESHOLD TUNING)
+// ─────────────────────────────────────────────────────────────────────────────
+// Computes the 50th, 95th, 99th percentiles and max for each angular rate.
+// This helps you decide whether the current thresholds (20 °/s for turns,
+// 15 °/s for braking/accel) are appropriate for your data.
+//
+// For example, if yaw_p99 = 18 °/s, it means 99% of readings are below
+// 18 °/s, so a 20 °/s threshold captures only the most extreme 1% of turns.
+//
+// If the thresholds are too sensitive (too many false positives), raise them.
+// If too conservative (missing real events), lower them.
+//
+// Note: We use abs() for yaw and pitch because these are signed (left/right,
+//       brake/accel), and we care about the magnitude for threshold comparison.
+//       Tilt rate is already unsigned.
+// ─────────────────────────────────────────────────────────────────────────────
+DrivingEvents_detail
+| where isnotnull(yaw_rate_dps)        // exclude noise-nullified rows
+| summarize
+    yaw_p50   = round(percentile(abs(yaw_rate_dps), 50), 2),    // median yaw speed
+    yaw_p95   = round(percentile(abs(yaw_rate_dps), 95), 2),    // 95th percentile
+    yaw_p99   = round(percentile(abs(yaw_rate_dps), 99), 2),    // 99th percentile
+    yaw_max   = round(max(abs(yaw_rate_dps)), 2),               // absolute peak
+    pitch_p50 = round(percentile(abs(pitch_rate_dps), 50), 2),
+    pitch_p95 = round(percentile(abs(pitch_rate_dps), 95), 2),
+    pitch_p99 = round(percentile(abs(pitch_rate_dps), 99), 2),
+    pitch_max = round(max(abs(pitch_rate_dps)), 2),
+    tilt_p50  = round(percentile(tilt_rate_dps, 50), 2),
+    tilt_p95  = round(percentile(tilt_rate_dps, 95), 2),
+    tilt_p99  = round(percentile(tilt_rate_dps, 99), 2),
+    tilt_max  = round(max(tilt_rate_dps), 2)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6e — HEALTH CHECK: RATE DISTRIBUTION SANITY
+// ─────────────────────────────────────────────────────────────────────────────
+// Quick data quality check:
+//   total_rows       — total detail rows.
+//   rows_over_100dps — rows with very high rotation (possible bumpy road or noise).
+//   rows_over_200dps — rows with extremely high rotation (likely noise).
+//   rows_null        — rows where rates were nullified due to noise guardrail.
+//   avg_total_rate   — average angular speed across all non-null rows.
+//
+// If rows_null or rows_over_200dps are a large fraction of total_rows,
+// investigate whether the sensor data has quality issues (gaps in timestamps,
+// corrupted quaternions, etc.).
+// ─────────────────────────────────────────────────────────────────────────────
+DrivingEvents_detail
+| summarize
+    total_rows       = count(),
+    rows_over_100dps = countif(total_angular_rate_dps > 100),
+    rows_over_200dps = countif(total_angular_rate_dps > 200),
+    rows_null        = countif(isnull(total_angular_rate_dps)),
+    avg_total_rate   = round(avg(total_angular_rate_dps), 2)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6f — DRILL INTO THE TRIP WITH THE MOST EVENTS
+// ─────────────────────────────────────────────────────────────────────────────
+// Finds the single trip with the highest total number of driving events
+// (sharp turns + hard stops + aggressive accels) and then retrieves all
+// the event rows for that trip, ordered chronologically.
+//
+// This is useful for detailed investigation: you can see the exact sequence
+// and timing of events within the most eventful trip, and inspect the
+// angular rate magnitudes that triggered each classification.
+//
+// The `let` statement creates a tabular expression (top_trip) containing
+// exactly one tripId, which is then used as a filter in the main query.
+// ─────────────────────────────────────────────────────────────────────────────
+let top_trip =
+    DrivingEvents_summary
+    | extend total = sharp_turn_count + hard_stop_count + aggressive_accel_count
+    | top 1 by total desc          // pick the single worst trip
+    | project tripId;              // extract just the tripId
+DrivingEvents_detail
+| where tripId in (top_trip)       // filter to that trip only
+| where is_sharp_turn or is_hard_stop or is_aggressive_accel  // only event rows
+| project timestamp, delta_seconds,
+          yaw_rate_dps, pitch_rate_dps, tilt_rate_dps, total_angular_rate_dps,
+          is_sharp_turn, is_hard_stop, is_aggressive_accel
+| order by timestamp asc           // chronological order
