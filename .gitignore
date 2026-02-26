@@ -1,0 +1,13 @@
+# OS / editor artefacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Azure Data Studio / VS Code workspace settings
+.vscode/
+*.code-workspace
+
+# KQL authoring tool output (if any)
+*.log
